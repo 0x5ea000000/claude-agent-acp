@@ -152,6 +152,11 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Set to true after a turn that threw before consuming the terminal
+   *  session_state_changed{idle} message. The next prompt's loop will
+   *  encounter that stale idle at the front of the query stream and must
+   *  skip it rather than returning early with no content. */
+  staleIdlePending: boolean;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -750,6 +755,7 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
+    let hadErrorThrow = false;
 
     try {
       while (true) {
@@ -832,6 +838,13 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
+                  if (session.staleIdlePending) {
+                    // This idle was left buffered by the previous failed turn
+                    // (loop threw before consuming it). Skip it so this prompt
+                    // continues reading its actual response (#53483).
+                    session.staleIdlePending = false;
+                    break;
+                  }
                   return { stopReason, usage: sessionUsage(session) };
                 }
                 break;
@@ -1165,6 +1178,7 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw new Error("Session did not end in result");
     } catch (error) {
+      hadErrorThrow = true;
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
       }
@@ -1189,6 +1203,14 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
+        if (hadErrorThrow) {
+          // The SDK emits session_state_changed{idle} as the turn boundary
+          // after every turn, including failed ones. When the loop exits via
+          // throw the idle is still buffered in the query. Mark it so the
+          // next prompt's loop can skip past it instead of returning early
+          // with no content (#53483).
+          session.staleIdlePending = true;
+        }
         // This usually should not happen, but in case the loop finishes
         // without claude sending all message replays, we resolve the
         // next pending prompt call to ensure no prompts get stuck.
@@ -2047,6 +2069,7 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      staleIdlePending: false,
     };
 
     return {
