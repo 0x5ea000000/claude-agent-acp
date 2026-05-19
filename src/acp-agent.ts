@@ -17,6 +17,7 @@ import {
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
+  PermissionOption,
   PromptRequest,
   PromptResponse,
   ReadTextFileRequest,
@@ -36,6 +37,8 @@ import {
   SetSessionModeResponse,
   CloseSessionRequest,
   CloseSessionResponse,
+  DeleteSessionRequest,
+  DeleteSessionResponse,
   TerminalHandle,
   TerminalOutputResponse,
   WriteTextFileRequest,
@@ -44,6 +47,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   CanUseTool,
+  deleteSession,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -69,10 +73,16 @@ import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { SettingsManager } from "./settings.js";
 import {
+  applyTaskCreate,
+  applyTaskUpdate,
   ClaudePlanEntry,
   createPostToolUseHook,
+  createTaskHook,
+  parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
+  TaskState,
+  taskStateToPlanEntries,
   toolInfoFromToolUse,
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
@@ -157,6 +167,9 @@ type Session = {
    *  encounter that stale idle at the front of the query stream and must
    *  skip it rather than returning early with no content. */
   staleIdlePending: boolean;
+  /** Accumulated task list for the session, keyed by task ID. Task IDs are
+   *  per-session, so this state must not be shared across sessions. */
+  taskState: TaskState;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -236,6 +249,8 @@ type GatewayAuthMeta = {
     headers: Record<string, string>;
   };
 };
+
+type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
 
 /**
  * Extra metadata that the agent provides for each tool_call / tool_update update.
@@ -481,7 +496,7 @@ export class ClaudeAcpAgent implements Agent {
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
-  gatewayAuthMeta?: GatewayAuthMeta;
+  gatewayAuthRequest?: GatewayAuthRequest;
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
@@ -504,6 +519,17 @@ export class ClaudeAcpAgent implements Agent {
       _meta: {
         gateway: {
           protocol: "anthropic",
+        },
+      },
+    };
+
+    const gatewayBedrockAuthMethod: AuthMethod = {
+      id: "gateway-bedrock",
+      name: "Custom model gateway",
+      description: "Use a custom gateway to authenticate and access models",
+      _meta: {
+        gateway: {
+          protocol: "bedrock",
         },
       },
     };
@@ -607,10 +633,12 @@ export class ClaudeAcpAgent implements Agent {
         },
         loadSession: true,
         sessionCapabilities: {
+          additionalDirectories: {},
+          close: {},
+          delete: {},
           fork: {},
           list: {},
           resume: {},
-          close: {},
         },
       },
       agentInfo: {
@@ -618,7 +646,10 @@ export class ClaudeAcpAgent implements Agent {
         title: "Claude Agent",
         version: packageJson.version,
       },
-      authMethods: [...terminalAuthMethods, ...(supportsGatewayAuth ? [gatewayAuthMethod] : [])],
+      authMethods: [
+        ...terminalAuthMethods,
+        ...(supportsGatewayAuth ? [gatewayAuthMethod, gatewayBedrockAuthMethod] : []),
+      ],
     };
   }
 
@@ -639,6 +670,7 @@ export class ClaudeAcpAgent implements Agent {
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
+        additionalDirectories: params.additionalDirectories,
         _meta: params._meta,
       },
       {
@@ -695,8 +727,8 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
-    if (_params.methodId === "gateway") {
-      this.gatewayAuthMeta = _params._meta as GatewayAuthMeta | undefined;
+    if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
+      this.gatewayAuthRequest = _params as GatewayAuthRequest;
       return;
     }
     throw new Error("Method not implemented.");
@@ -863,6 +895,7 @@ export class ClaudeAcpAgent implements Agent {
               case "notification":
               case "api_retry":
               case "mirror_error":
+              case "permission_denied":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -1053,6 +1086,7 @@ export class ClaudeAcpAgent implements Agent {
               {
                 clientCapabilities: this.clientCapabilities,
                 cwd: session.cwd,
+                taskState: session.taskState,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1101,13 +1135,36 @@ export class ClaudeAcpAgent implements Agent {
               }
             }
 
-            // Slash commands like /compact can generate invalid output... doesn't match
-            // their own docs: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-slash-commands#%2Fcompact-compact-conversation-history
+            // Strip <command-*>/<local-command-stdout> markers and render any
+            // remaining prose. Skill bodies and built-in slash commands (e.g.
+            // /usage, /status, /model) arrive wrapped in these tags; pure-marker
+            // payloads (e.g. /compact's malformed output) strip to null and are
+            // skipped. Mirrors the replay path at replaySessionHistory.
             if (
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
             ) {
-              this.logger.log(message.message.content);
+              const stripped = stripLocalCommandMetadata(message.message.content);
+              if (typeof stripped === "string") {
+                for (const notification of toAcpNotifications(
+                  stripped,
+                  message.message.role,
+                  params.sessionId,
+                  this.toolUseCache,
+                  this.client,
+                  this.logger,
+                  {
+                    clientCapabilities: this.clientCapabilities,
+                    parentToolUseId: message.parent_tool_use_id,
+                    cwd: session.cwd,
+                    taskState: session.taskState,
+                  },
+                )) {
+                  await this.client.sessionUpdate(notification);
+                }
+              } else {
+                this.logger.log(message.message.content);
+              }
               break;
             }
 
@@ -1159,6 +1216,7 @@ export class ClaudeAcpAgent implements Agent {
                 clientCapabilities: this.clientCapabilities,
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
+                taskState: session.taskState,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1264,6 +1322,16 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session not found");
     }
     await this.teardownSession(params.sessionId);
+    return {};
+  }
+
+  async unstable_deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    // Tear down any active in-memory state first so the on-disk file isn't
+    // recreated by an outstanding query writing to it.
+    if (this.sessions[params.sessionId]) {
+      await this.teardownSession(params.sessionId);
+    }
+    await deleteSession(params.sessionId);
     return {};
   }
 
@@ -1421,6 +1489,7 @@ export class ClaudeAcpAgent implements Agent {
           registerHooks: false,
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
+          taskState: this.sessions[sessionId]?.taskState,
         },
       )) {
         await this.client.sessionUpdate(notification);
@@ -1451,7 +1520,7 @@ export class ClaudeAcpAgent implements Agent {
       }
 
       if (toolName === "ExitPlanMode") {
-        const optionsAll = [
+        const optionsAll: PermissionOption[] = [
           { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
           {
             kind: "allow_always",
@@ -1730,6 +1799,7 @@ export class ClaudeAcpAgent implements Agent {
     sessionId: string;
     cwd: string;
     mcpServers?: NewSessionRequest["mcpServers"];
+    additionalDirectories?: NewSessionRequest["additionalDirectories"];
     _meta?: NewSessionRequest["_meta"];
   }): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
@@ -1754,6 +1824,7 @@ export class ClaudeAcpAgent implements Agent {
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
+        additionalDirectories: params.additionalDirectories,
         _meta: params._meta,
       },
       {
@@ -1803,7 +1874,7 @@ export class ClaudeAcpAgent implements Agent {
               ? Object.fromEntries(server.headers.map((e) => [e.name, e.value]))
               : undefined,
           };
-        } else {
+        } else if (!("type" in server)) {
           // Stdio type MCP server (with or without explicit type field)
           mcpServers[server.name] = {
             type: "stdio",
@@ -1867,6 +1938,11 @@ export class ClaudeAcpAgent implements Agent {
 
     const abortController = userProvidedOptions?.abortController || new AbortController();
 
+    // Per-session task state. Created here (rather than in the session record
+    // below) so the TaskCreated/TaskCompleted hook callbacks can close over
+    // the same Map that the streaming message handler will read from.
+    const taskState: TaskState = new Map();
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -1886,7 +1962,7 @@ export class ClaudeAcpAgent implements Agent {
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
-        ...createEnvForGateway(this.gatewayAuthMeta),
+        ...createEnvForGateway(this.gatewayAuthRequest),
         // Opt-in to session state events like when the agent is idle
         CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
       },
@@ -1927,14 +2003,58 @@ export class ClaudeAcpAgent implements Agent {
             ],
           },
         ],
+        TaskCreated: [
+          ...(userProvidedOptions?.hooks?.TaskCreated || []),
+          {
+            hooks: [
+              createTaskHook({
+                taskState,
+                onChange: async () => {
+                  await this.client.sessionUpdate({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "plan",
+                      entries: taskStateToPlanEntries(taskState),
+                    },
+                  });
+                },
+              }),
+            ],
+          },
+        ],
+        TaskCompleted: [
+          ...(userProvidedOptions?.hooks?.TaskCompleted || []),
+          {
+            hooks: [
+              createTaskHook({
+                taskState,
+                onChange: async () => {
+                  await this.client.sessionUpdate({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "plan",
+                      entries: taskStateToPlanEntries(taskState),
+                    },
+                  });
+                },
+              }),
+            ],
+          },
+        ],
       },
       ...creationOpts,
       abortController,
     };
 
+    // Prefer the official ACP `additionalDirectories` field. Fall back to the
+    // legacy `_meta.additionalRoots` extension for clients that haven't been
+    // updated yet. Either source is merged with directories supplied via
+    // `_meta.claudeCode.options.additionalDirectories` (SDK pass-through).
+    const acpAdditionalDirectories =
+      params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
     options.additionalDirectories = [
       ...(userProvidedOptions?.additionalDirectories ?? []),
-      ...(sessionMeta?.additionalRoots ?? []),
+      ...acpAdditionalDirectories,
     ];
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
@@ -1970,7 +2090,7 @@ export class ClaudeAcpAgent implements Agent {
     if (
       shouldHideClaudeAuth() &&
       initializationResult.account.subscriptionType &&
-      !this.gatewayAuthMeta
+      !this.gatewayAuthRequest
     ) {
       throw RequestError.authRequired(
         undefined,
@@ -2070,6 +2190,7 @@ export class ClaudeAcpAgent implements Agent {
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
       staleIdlePending: false,
+      taskState,
     };
 
     return {
@@ -2160,16 +2281,26 @@ function snapshotFromUsage(usage: {
   };
 }
 
-function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
-  if (!gatewayMeta) {
+function createEnvForGateway(request?: GatewayAuthRequest) {
+  if (!request?._meta) {
     return {};
   }
+  const customHeaders = Object.entries(request._meta.gateway.headers)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join("\n");
+
+  if (request.methodId === "gateway-bedrock") {
+    return {
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      AWS_BEARER_TOKEN_BEDROCK: " ", // Must be non-empty to bypass pass configuration check
+      ANTHROPIC_BEDROCK_BASE_URL: request._meta.gateway.baseUrl,
+      ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+    };
+  }
   return {
-    ANTHROPIC_BASE_URL: gatewayMeta.gateway.baseUrl,
-    ANTHROPIC_CUSTOM_HEADERS: Object.entries(gatewayMeta.gateway.headers)
-      .map(([key, value]) => `${key}: ${value}`)
-      .join("\n"),
-    ANTHROPIC_AUTH_TOKEN: "", // Must be specified to bypass claude login requirement
+    ANTHROPIC_BASE_URL: request._meta.gateway.baseUrl,
+    ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+    ANTHROPIC_AUTH_TOKEN: " ", // Must be specified to bypass claude login requirement
   };
 }
 
@@ -2619,8 +2750,10 @@ export function toAcpNotifications(
     clientCapabilities?: ClientCapabilities;
     parentToolUseId?: string | null;
     cwd?: string;
+    taskState?: TaskState;
   },
 ): SessionNotification[] {
+  const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
@@ -2694,6 +2827,15 @@ export function toAcpNotifications(
               entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
             };
           }
+        } else if (
+          chunk.name === "TaskCreate" ||
+          chunk.name === "TaskUpdate" ||
+          chunk.name === "TaskList" ||
+          chunk.name === "TaskGet"
+        ) {
+          // Task* tool_use is suppressed; the plan update is emitted at
+          // tool_result time once we have the task ID (for TaskCreate) and
+          // confirmation that the change took effect.
         } else {
           // Only register hooks on first encounter to avoid double-firing
           if (registerHooks && !alreadyCached) {
@@ -2798,7 +2940,36 @@ export function toAcpNotifications(
           break;
         }
 
-        if (toolUse.name !== "TodoWrite") {
+        if (
+          toolUse.name === "TaskCreate" ||
+          toolUse.name === "TaskUpdate" ||
+          toolUse.name === "TaskList" ||
+          toolUse.name === "TaskGet"
+        ) {
+          // Headless/SDK sessions emit Task* tools instead of TodoWrite.
+          // TaskCreate / TaskUpdate mutate the accumulated task list; TaskList
+          // and TaskGet are read-only so we just suppress their tool_call /
+          // tool_result events. The plan update is emitted as a snapshot of
+          // the accumulated state, mirroring the legacy TodoWrite behavior.
+          const isError = "is_error" in chunk && chunk.is_error;
+          if (!isError) {
+            if (toolUse.name === "TaskCreate") {
+              applyTaskCreate(
+                taskState,
+                toolUse.input as Parameters<typeof applyTaskCreate>[1],
+                parseTaskCreateOutput(chunk.content),
+              );
+            } else if (toolUse.name === "TaskUpdate") {
+              applyTaskUpdate(taskState, toolUse.input as Parameters<typeof applyTaskUpdate>[1]);
+            }
+          }
+          if (!isError && (toolUse.name === "TaskCreate" || toolUse.name === "TaskUpdate")) {
+            update = {
+              sessionUpdate: "plan",
+              entries: taskStateToPlanEntries(taskState),
+            };
+          }
+        } else if (toolUse.name !== "TodoWrite") {
           const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
             chunk,
             toolUseCache[chunk.tool_use_id],
@@ -2885,6 +3056,7 @@ export function streamEventToAcpNotifications(
   options?: {
     clientCapabilities?: ClientCapabilities;
     cwd?: string;
+    taskState?: TaskState;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -2901,6 +3073,7 @@ export function streamEventToAcpNotifications(
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
+          taskState: options?.taskState,
         },
       );
     case "content_block_delta":
@@ -2915,6 +3088,7 @@ export function streamEventToAcpNotifications(
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
+          taskState: options?.taskState,
         },
       );
     // No content
